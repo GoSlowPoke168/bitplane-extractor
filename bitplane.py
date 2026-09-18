@@ -32,6 +32,7 @@ import os
 import re
 import sys
 from collections import Counter
+from datetime import datetime
 
 import numpy as np
 from PIL import Image
@@ -171,9 +172,30 @@ def hex_view(data, width=64):
 # like a delimited token / URI / path, or it scores as human-readable text.
 
 PRINTABLE = rb"[\x20-\x7e]{%d,}"
-# tag{...} with any tag and any contents - no vocabulary. The 2-char tag and
-# 4-char body keep random braces in bit noise from matching.
-DELIMITED = re.compile(r"[A-Za-z][A-Za-z0-9_.\-]{1,23}\{[\x20-\x7e]{4,160}?\}")
+# tag{...} with any tag and any contents - no vocabulary. The tag and body
+# shapes are what keep random braces in bit noise from matching.
+DELIMITED = re.compile(r"[A-Za-z][A-Za-z0-9_.\-]{1,23}\{([\x20-\x7e]{5,160}?)\}")
+BODY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz"
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- ")
+
+
+def struct_ok(s):
+    """A URI/email/path shape is cheap for noise to hit by accident - these are
+    the properties real ones have: lowercase words, and enough of them."""
+    letters = [c for c in s if c.isalpha()]
+    lower = sum(c.islower() for c in letters) / len(letters) if letters else 0.0
+    if "://" in s:
+        return len(letters) >= 4 and lower >= 0.7
+    if "@" in s:
+        local, _, domain = s.partition("@")
+        return len(local) >= 3 and len(domain) >= 5 and lower >= 0.7
+    return len(s) >= 10 and len(letters) >= 0.5 * len(s) and lower >= 0.7
+
+
+def token_ok(body):
+    """Flag bodies are overwhelmingly alphanumeric; noise between two random
+    braces is not. Rejects Vb{W&+XJ} without touching flag{th1s 1s 4 fl4g!}."""
+    return sum(c in BODY_CHARS for c in body) >= 0.7 * len(body)
 # scheme://..., user@host.tld, /unix/paths, C:\windows\paths
 # possessive quantifiers keep these linear on long noise runs (no backtracking)
 STRUCTURED = re.compile(
@@ -344,9 +366,13 @@ def analyze(data, pattern=None, min_str=8, min_score=0.55, raw=False,
             continue
         special = False
         for m in DELIMITED.finditer(s):
+            if not token_ok(m.group(1)):
+                continue
             found.append(("TOKEN", m.group()))
             special = True
         for m in STRUCTURED.finditer(s):
+            if not struct_ok(m.group()):
+                continue
             found.append(("STRUCT", m.group()))
             special = True
         enc = encoded_blob(s)
@@ -420,13 +446,17 @@ def plan(cache, args):
     tasks = []
     for planes in combos:
         for po in pixel_orders:
+            # Different (bit order, channel order) pairs often produce the exact
+            # same plane sequence - one plane per channel makes MSB and LSB
+            # identical, for instance. Keep one representative of each sequence
+            # instead of decoding the same bytes several times.
+            seq_seen = {}
             for bo in bit_orders:
-                # collapse channel permutations that yield the same plane sequence
-                seq_seen = {}
                 for plo in plane_orders:
-                    seq_seen.setdefault(tuple(order_planes(list(planes), plo, bo)), plo)
-                for plo in seq_seen.values():
-                    tasks.append((planes, po, bo, plo))
+                    seq = tuple(order_planes(list(planes), plo, bo))
+                    seq_seen.setdefault(seq, (bo, plo))
+            for bo, plo in seq_seen.values():
+                tasks.append((planes, po, bo, plo))
     return all_planes, combos, tasks
 
 
@@ -462,11 +492,29 @@ def brute(cache, args):
         len(all_planes), len(combos), len(tasks)), file=sys.stderr)
     print("[*] scanning first %s bytes per run" % (args.limit_bytes or "ALL"),
           file=sys.stderr)
+    if args.limit_bytes:
+        # the limit is in output bytes, so the deeper the stack of planes the
+        # fewer pixels it reaches - say how much of the image that really is
+        widest = max(len(t[0]) for t in tasks)
+        covered = args.limit_bytes * 8 / widest / cache.npixels
+        if covered < 0.9:
+            print("[!] that is the first %.0f%% of the image at %d plane%s; a "
+                  "payload past that point is missed - raise --limit-bytes, or "
+                  "0 for whole planes" % (covered * 100, widest, "" if widest == 1 else "s"),
+                  file=sys.stderr)
     if args.save:
+        if args.save_all:
+            nbytes = sum(min(args.limit_bytes or cache.npixels * len(t[0]) // 8,
+                             cache.npixels * len(t[0]) // 8) for t in tasks)
+            print("[*] saving every run to %s/: %d files, ~%.0f MB" % (
+                args.save, len(tasks), nbytes / 1e6), file=sys.stderr)
+            if nbytes > 2e9 and not args.force:
+                sys.exit("[!] that is over 2 GB. Narrow it (--max-planes 1, "
+                         "--only-bits 0,1, a smaller --limit-bytes), drop "
+                         "--save-all to keep only hits, or pass --force.")
+        else:
+            print("[*] saving runs that hit to %s/" % args.save, file=sys.stderr)
         os.makedirs(args.save, exist_ok=True)
-        print("[*] saving %s to %s/" % (
-            "every run" if args.save_all else "runs that hit", args.save),
-            file=sys.stderr)
 
     jobs = min(args.jobs, len(tasks)) if args.jobs > 0 else 1
     if jobs > 1:
@@ -503,6 +551,7 @@ def brute(cache, args):
             pool.terminate()
             pool.join()
 
+    sys.stdout.flush()
     if not hits:
         print("[-] nothing found. try --deep, a lower --min-score/--min-text, "
               "--raw-strings, or your own --pattern", file=sys.stderr)
@@ -511,6 +560,51 @@ def brute(cache, args):
     if args.save:
         print("[*] %d file(s) in %s/" % (len(os.listdir(args.save)), args.save),
               file=sys.stderr)
+
+
+# ---------------------------------------------------------------- rendering
+def default_render_dir(image_path):
+    """<image>_planes_<date>, so two runs never quietly overwrite each other."""
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    return "%s_planes_%s" % (stem, datetime.now().strftime("%Y%m%d-%H%M"))
+
+
+
+def render_planes(cache, outdir, tile=340):
+    """Write every single bit plane as a black/white PNG, plus one contact
+    sheet of all of them - some payloads are drawn in a plane (QR codes, text,
+    logos) and are invisible to any amount of string analysis."""
+    from PIL import ImageDraw
+
+    os.makedirs(outdir, exist_ok=True)
+    h, w = cache.arr.shape[:2]
+    thumb_w = min(tile, w)
+    thumb_h = max(1, round(h * thumb_w / w))
+    pad, bar = 8, 16
+
+    thumbs = {}
+    for ci, c in enumerate(cache.channels):
+        for b in range(8):
+            bits = (cache.arr[:, :, ci] >> b) & 1
+            img = Image.fromarray(bits.astype(bool))     # 1-bit: 8x faster to
+            img.save(os.path.join(outdir, "%s%d.png" % (c, b)))   # write, 40% smaller
+            thumbs[(c, b)] = img.convert("L").resize((thumb_w, thumb_h),
+                                                     Image.NEAREST)
+
+    cols, rows = len(cache.channels), 8
+    cell_w, cell_h = thumb_w + pad, thumb_h + bar + pad
+    sheet = Image.new("RGB", (cols * cell_w + pad, rows * cell_h + pad), "white")
+    draw = ImageDraw.Draw(sheet)
+    for ci, c in enumerate(cache.channels):
+        for ri, b in enumerate(range(7, -1, -1)):          # bit 7 on top
+            x, y = pad + ci * cell_w, pad + ri * cell_h
+            draw.text((x, y), "%s%d" % (c, b), fill="black")
+            sheet.paste(thumbs[(c, b)], (x, y + bar))
+    path = os.path.join(outdir, "contact-sheet.png")
+    sheet.save(path)
+    print("[*] %d planes + contact sheet in %s/" % (len(thumbs), outdir),
+          file=sys.stderr)
+    return path
 
 
 # ---------------------------------------------------------------- main
@@ -551,11 +645,21 @@ def main():
     ap.add_argument("--plane-order", default="RGBA",
                     help="channel grouping order, e.g. RGB / BGR (default RGBA)")
     ap.add_argument("--trim", action="store_true", help="trim trailing partial byte")
-    ap.add_argument("--out", help="write raw extracted bytes to this file")
+    ap.add_argument("--out", metavar="FILE",
+                    help="write raw extracted bytes to FILE, or to stdout with "
+                         "'-' so you can pipe them into binwalk/foremost/strings")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="suppress the ascii/hex report (use when piping --out -)")
     ap.add_argument("--show", type=int, default=2500,
                     help="bytes of hex/ascii to print (0 = all, default 2500)")
     ap.add_argument("--list-strings", type=int, metavar="N", default=0,
                     help="also print every printable string of length >= N")
+    ap.add_argument("--render", nargs="?", const="bitplanes", metavar="DIR",
+                    help="directory for the plane images a sweep writes "
+                         "(default: <image>_planes/); with --bits it renders "
+                         "them instead of extracting")
+    ap.add_argument("--no-render", action="store_true",
+                    help="skip the plane images and only run the sweep")
     ap.add_argument("--scan", action="store_true",
                     help="run the same detectors brute mode uses on this extraction")
     # brute options
@@ -597,8 +701,13 @@ def main():
     ap.add_argument("--jobs", "-j", type=int, default=min(8, os.cpu_count() or 1),
                     metavar="N", help="worker processes for the sweep "
                                       "(default %(default)d, 1 = no forking)")
+    ap.add_argument("--force", action="store_true",
+                    help="go ahead with a --save-all that would write over 2 GB")
     ap.add_argument("--progress", action="store_true")
     args = ap.parse_args()
+
+    if args.save_all and not args.save:
+        ap.error("--save-all needs a destination: --save DIR --save-all")
 
     if args.deep:                        # one flag instead of five
         args.all_orders = True
@@ -611,21 +720,42 @@ def main():
     args.plane_order = "".join(c for c in args.plane_order.upper() if c in channels) or channels
 
     if args.brute or args.deep or not args.bits:
+        sheet = None
+        big = cache.npixels > 4e6
+        if args.render is None and big and not args.no_render:
+            # one plane is npixels/8 bytes and noise planes barely compress,
+            # so channels*8 of them is up to npixels*channels bytes
+            print("[*] %.0f MP image - skipping the plane images (up to %.0f MB "
+                  "of them); pass --render DIR to write them anyway"
+                  % (cache.npixels / 1e6,
+                     cache.npixels * len(cache.channels) / 1e6), file=sys.stderr)
+        elif not args.no_render:         # eyes first: some stego is only visible
+            outdir = args.render or default_render_dir(args.image)
+            sheet = render_planes(cache, outdir)
         brute(cache, args)               # sweeping is the default with no --bits
+        if sheet:
+            sys.stdout.flush()
+            print("\n[*] look at %s for anything drawn into a plane" % sheet,
+                  file=sys.stderr)
+        return
+
+    if args.render is not None:
+        render_planes(cache, args.render)
         return
 
     planes = parse_bits(args.bits, channels)
     data = extract(cache, planes, args.order, args.bit_order,
                    args.plane_order, args.trim)
 
-    print("Planes : %s" % label(order_planes(planes, args.plane_order, args.bit_order),
-                                args.order, args.bit_order, args.plane_order))
-    print("Size   : %d bytes" % len(data))
-    ids = identify(data)
-    print("Type   : %s" % (", ".join(ids) if ids else "No file types identified."))
-    shown = data if args.show == 0 else data[:args.show]
-    print("\nAscii (readable only):\n%s" % ascii_view(shown))
-    print("\nHex (accurate):\n%s" % hex_view(shown))
+    if not args.quiet:
+        print("Planes : %s" % label(order_planes(planes, args.plane_order, args.bit_order),
+                                    args.order, args.bit_order, args.plane_order))
+        print("Size   : %d bytes" % len(data))
+        ids = identify(data)
+        print("Type   : %s" % (", ".join(ids) if ids else "No file types identified."))
+        shown = data if args.show == 0 else data[:args.show]
+        print("\nAscii (readable only):\n%s" % ascii_view(shown))
+        print("\nHex (accurate):\n%s" % hex_view(shown))
     if args.scan:
         pat = re.compile(args.pattern.encode(), re.IGNORECASE) if args.pattern else None
         found = analyze(data, pat, args.min_str, args.min_score,
@@ -643,10 +773,14 @@ def main():
         print("\nStrings (>=%d):" % args.list_strings)
         for s in printable_runs(data, args.list_strings):
             print("  %s" % s)
-    if args.out:
+    if args.out == "-":
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    elif args.out:
         with open(args.out, "wb") as f:
             f.write(data)
-        print("\n[+] wrote %d bytes to %s" % (len(data), args.out))
+        print("[+] wrote %d bytes to %s" % (len(data), args.out),
+              file=sys.stderr if args.quiet else sys.stdout)
 
 
 if __name__ == "__main__":
